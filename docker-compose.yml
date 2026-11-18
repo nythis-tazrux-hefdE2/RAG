@@ -1,0 +1,534 @@
+name: ${COMPOSE_PROJECT_NAME:-rag}
+
+x-api-worker-env: &api-worker-env
+  RAG_HOST_IP: ${RAG_HOST_IP:-}
+  RAG_KNOWLEDGE_ENABLED: ${RAG_KNOWLEDGE_ENABLED:-true}
+  RAG_RUNNING_IN_DOCKER: "true"
+  RAG_ENV: development
+  RAG_JWT_SECRET_KEY: ${RAG_JWT_SECRET_KEY:?Set RAG_JWT_SECRET_KEY in .env, or rerun `bash scripts/init.sh`.}
+  RAG_INSTANCE_ID: ${RAG_INSTANCE_ID:?Set RAG_INSTANCE_ID in .env, or rerun `bash scripts/init.sh`.}
+  RAG_API_KEY_DERIVATION_SECRET: ${RAG_API_KEY_DERIVATION_SECRET:?Set RAG_API_KEY_DERIVATION_SECRET in .env, or rerun `bash scripts/init.sh`.}
+  RAG_RAPIDOCR_MODEL_DIR: /home/rag/.cache/rapidocr/models
+  # DBs and other services
+  RAG_POSTGRES_URL: ${RAG_POSTGRES_URL:-postgresql+asyncpg://${RAG_POSTGRES_USER:-postgres}:${RAG_POSTGRES_PASSWORD:-postgres}@postgres:5432/${RAG_POSTGRES_DB:-rag}}
+  RAG_REDIS_URL: ${RAG_REDIS_URL:-redis://redis:6379/0}
+  RAG_NEO4J_URI: ${RAG_NEO4J_URI:-bolt://graph:7687}
+  RAG_NEO4J_USERNAME: ${RAG_NEO4J_USERNAME:-neo4j}
+  RAG_NEO4J_PASSWORD: ${RAG_NEO4J_PASSWORD:-0123456789}
+  RAG_MILVUS_URI: ${RAG_MILVUS_URI:-http://milvus:19530}
+  RAG_MILVUS_TOKEN: ${RAG_MILVUS_TOKEN:-}
+  RAG_MILVUS_DB: ${RAG_MILVUS_DB:-rag}
+  RAG_MINIO_URI: ${RAG_MINIO_URI:-http://minio:9000}
+  RAG_MINIO_ACCESS_KEY: ${RAG_MINIO_ACCESS_KEY:-minioadmin}
+  RAG_MINIO_SECRET_KEY: ${RAG_MINIO_SECRET_KEY:-minioadmin}
+  # 文档解析
+  RAG_MINERU_API_KEY: ${RAG_MINERU_API_KEY:-}
+  RAG_MINERU_API_URI: ${RAG_MINERU_API_URI:-http://mineru-api:30001}
+  RAG_PADDLEX_URI: ${RAG_PADDLEX_URI:-http://paddlex:8080}
+  # 独立 runner 管理每次执行的临时容器
+  RAG_SANDBOX_BACKEND: container
+  RAG_SANDBOX_RUNNER_URL: ${RAG_SANDBOX_RUNNER_URL:-http://sandbox-runner:8090}
+  RAG_SANDBOX_RUNNER_TOKEN: ${RAG_SANDBOX_RUNNER_TOKEN:-}
+  RAG_SANDBOX_IDLE_SECONDS: ${RAG_SANDBOX_IDLE_SECONDS:-300}
+  RAG_SANDBOX_EXEC_TIMEOUT_SECONDS: ${RAG_SANDBOX_EXEC_TIMEOUT_SECONDS:-180}
+  RAG_SANDBOX_MAX_OUTPUT_BYTES: ${RAG_SANDBOX_MAX_OUTPUT_BYTES:-262144}
+  RAG_BACKGROUND_JOB_DEFAULT_TIMEOUT_SECONDS: ${RAG_BACKGROUND_JOB_DEFAULT_TIMEOUT_SECONDS:-86400}
+  # Agent run
+  RAG_RUN_CANCEL_KEY_TTL_SECONDS: ${RAG_RUN_CANCEL_KEY_TTL_SECONDS:-1800}
+  RAG_RUN_EVENTS_STREAM_TTL_SECONDS: ${RAG_RUN_EVENTS_STREAM_TTL_SECONDS:-7200}
+  RAG_READINESS_PROBE_TIMEOUT_SECONDS: ${RAG_READINESS_PROBE_TIMEOUT_SECONDS:-2}
+  RAG_READINESS_CACHE_TTL_SECONDS: ${RAG_READINESS_CACHE_TTL_SECONDS:-1}
+  RAG_CORS_ORIGINS: ${RAG_CORS_ORIGINS:-}
+  RAG_DATASET_PERSIST_BATCH_SIZE: ${RAG_DATASET_PERSIST_BATCH_SIZE:-1}
+  RAG_SKILL_DATA_DIR: /app/skill-sources
+  RAG_SKILL_PROJECTION_DIR: /app/skill-projections
+  # 其他环境变量
+  NO_PROXY: localhost,127.0.0.1,milvus,graph,minio,etcd,mineru,paddlex,api.siliconflow.cn
+  no_proxy: localhost,127.0.0.1,milvus,graph,minio,etcd,mineru,paddlex,api.siliconflow.cn
+
+# 长驻服务的容器日志轮转上界，防止 docker json.log 无限增长占满磁盘。
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "50m"
+    max-file: "3"
+
+services:
+  api:
+    build:
+      context: .
+      dockerfile: docker/api.Dockerfile
+    image: ${COMPOSE_PROJECT_NAME:-rag}-api:${RAG_VERSION:-0.8.0.beta4}
+    working_dir: /app
+    user: "1000:1000"
+    volumes:
+      - ./backend/rag:/app/rag
+      - type: bind
+        source: ${RAG_STATE_DIR:-./docker/volumes}/rag/threads
+        target: /app/user-data
+      - type: bind
+        source: ${RAG_STATE_DIR:-./docker/volumes}/rag/skill-sources
+        target: /app/skill-sources
+      - type: bind
+        source: ${RAG_STATE_DIR:-./docker/volumes}/rag/skill-projections
+        target: /app/skill-projections
+    ports:
+      - "${RAG_API_PORT:-25050}:5050"
+    networks:
+      - app-network
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    env_file:
+      - ${RAG_ENV_FILE:-.env}
+    # region api_envs
+    environment:
+      <<: *api-worker-env
+      RAG_RUNTIME_DIR: /app/runtime/api
+      RAG_USER_DATA_DIR: /app/user-data
+      RAG_POSTGRES_POOL_SIZE: ${RAG_API_POSTGRES_POOL_SIZE:-120}
+      RAG_POSTGRES_MAX_OVERFLOW: ${RAG_API_POSTGRES_MAX_OVERFLOW:-40}
+      RAG_POSTGRES_POOL_TIMEOUT_SECONDS: ${RAG_API_POSTGRES_POOL_TIMEOUT_SECONDS:-30}
+      RAG_LANGGRAPH_POSTGRES_POOL_SIZE: ${RAG_API_LANGGRAPH_POSTGRES_POOL_SIZE:-10}
+      RAG_LANGGRAPH_POSTGRES_POOL_TIMEOUT_SECONDS: ${RAG_API_LANGGRAPH_POSTGRES_POOL_TIMEOUT_SECONDS:-30}
+      RAG_REDIS_MAX_CONNECTIONS: ${RAG_API_REDIS_MAX_CONNECTIONS:-256}
+    # endregion api_envs
+    command: uv run --no-sync --no-dev uvicorn rag.api.main:app --no-access-log --host 0.0.0.0 --port 5050 --timeout-graceful-shutdown 5
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:5050/api/system/ready || exit 1"]
+      interval: 30s
+      timeout: 15s
+      retries: 8
+      start_period: 180s
+    depends_on:
+      storage-init:
+        condition: service_completed_successfully
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+      app-init:
+        condition: service_completed_successfully
+
+  worker:
+    build:
+      context: .
+      dockerfile: docker/api.Dockerfile
+    image: ${COMPOSE_PROJECT_NAME:-rag}-api:${RAG_VERSION:-0.8.0.beta4}
+    working_dir: /app
+    user: "1000:1000"
+    volumes:
+      - ./backend/rag:/app/rag
+      - type: bind
+        source: ${RAG_STATE_DIR:-./docker/volumes}/rag/threads
+        target: /app/user-data
+      - type: bind
+        source: ${RAG_STATE_DIR:-./docker/volumes}/rag/skill-sources
+        target: /app/skill-sources
+      - type: bind
+        source: ${RAG_STATE_DIR:-./docker/volumes}/rag/skill-projections
+        target: /app/skill-projections
+      - ./backend/pyproject.toml:/app/pyproject.toml
+      - ./backend/uv.lock:/app/uv.lock
+    networks:
+      - app-network
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    env_file:
+      - ${RAG_ENV_FILE:-.env}
+    environment:
+      <<: *api-worker-env
+      RAG_RUNTIME_DIR: /app/runtime/worker
+      RAG_USER_DATA_DIR: /app/user-data
+      RAG_ARQ_MAX_JOBS: ${RAG_ARQ_MAX_JOBS:-10}
+      RAG_REDIS_MAX_CONNECTIONS: ${RAG_WORKER_REDIS_MAX_CONNECTIONS:-256}
+      RAG_POSTGRES_POOL_SIZE: ${RAG_WORKER_POSTGRES_POOL_SIZE:-120}
+      RAG_POSTGRES_MAX_OVERFLOW: ${RAG_WORKER_POSTGRES_MAX_OVERFLOW:-40}
+      RAG_POSTGRES_POOL_TIMEOUT_SECONDS: ${RAG_WORKER_POSTGRES_POOL_TIMEOUT_SECONDS:-30}
+      RAG_LANGGRAPH_POSTGRES_POOL_SIZE: ${RAG_WORKER_LANGGRAPH_POSTGRES_POOL_SIZE:-120}
+      RAG_LANGGRAPH_POSTGRES_POOL_TIMEOUT_SECONDS: ${RAG_WORKER_LANGGRAPH_POSTGRES_POOL_TIMEOUT_SECONDS:-30}
+    command: uv run --no-sync --no-dev python -m rag.workers.main
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-m", "rag.workers.health"]
+      interval: 10s
+      timeout: 10s
+      retries: 6
+      start_period: 180s
+    depends_on:
+      storage-init:
+        condition: service_completed_successfully
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+      app-init:
+        condition: service_completed_successfully
+
+  app-init:
+    build:
+      context: .
+      dockerfile: docker/api.Dockerfile
+    image: ${COMPOSE_PROJECT_NAME:-rag}-api:${RAG_VERSION:-0.8.0.beta4}
+    working_dir: /app
+    volumes:
+      - ${RAG_STATE_DIR:-./docker/volumes}/rag/skill-sources:/app/skill-sources
+      - ./backend/rag:/app/rag:ro
+    networks:
+      - app-network
+    env_file:
+      - ${RAG_ENV_FILE:-.env}
+    environment:
+      <<: *api-worker-env
+    command: uv run --no-sync --no-dev python -m rag.bootstrap.app
+    restart: "no"
+    depends_on:
+      storage-init:
+        condition: service_completed_successfully
+      postgres:
+        condition: service_healthy
+
+
+  # Container 沙盒后端：预构建/预拉取镜像后由 runner 按 Run 创建临时容器。
+  sandbox-image:
+    build:
+      context: .
+      dockerfile: docker/sandbox.Dockerfile
+    image: ${RAG_SANDBOX_CONTAINER_IMAGE:-rag-sandbox:${RAG_VERSION:-0.8.0.beta4}}
+    command: ["true"]
+    network_mode: none
+    restart: "no"
+
+  sandbox-runner:
+    build:
+      context: .
+      dockerfile: docker/api.Dockerfile
+    image: ${COMPOSE_PROJECT_NAME:-rag}-api:${RAG_VERSION:-0.8.0.beta4}
+    working_dir: /app
+    # Docker socket 等价于宿主 root；只允许这个专用进程持有。
+    user: "0:0"
+    volumes:
+      - ./backend/rag:/app/rag
+      - /var/run/docker.sock:/var/run/docker.sock
+      - type: bind
+        source: ${RAG_STATE_DIR:-./docker/volumes}/rag/threads
+        target: /sandbox-data
+      - type: bind
+        source: ${RAG_STATE_DIR:-./docker/volumes}/rag/skill-projections
+        target: /sandbox-skill-projections
+        read_only: true
+    networks:
+      - app-network
+    environment:
+      RAG_POSTGRES_URL: ${RAG_POSTGRES_URL:-postgresql+asyncpg://${RAG_POSTGRES_USER:-postgres}:${RAG_POSTGRES_PASSWORD:-postgres}@postgres:5432/${RAG_POSTGRES_DB:-rag}}
+      RAG_ENV: ${RAG_ENV:-development}
+      RAG_SANDBOX_RUNNER_TOKEN: ${RAG_SANDBOX_RUNNER_TOKEN:-}
+      RAG_SANDBOX_CONTAINER_SOCKET: /var/run/docker.sock
+      RAG_SANDBOX_CONTAINER_IMAGE: ${RAG_SANDBOX_CONTAINER_IMAGE:-rag-sandbox:${RAG_VERSION:-0.8.0.beta4}}
+      RAG_SANDBOX_CONTAINER_IMAGE_DIGEST: ${RAG_SANDBOX_CONTAINER_IMAGE_DIGEST:-}
+      RAG_SANDBOX_CONTAINER_NETWORK: ${RAG_SANDBOX_CONTAINER_NETWORK:-none}
+      RAG_SANDBOX_CONTAINER_MEMORY_BYTES: ${RAG_SANDBOX_CONTAINER_MEMORY_BYTES:-1073741824}
+      RAG_SANDBOX_CONTAINER_CPUS: ${RAG_SANDBOX_CONTAINER_CPUS:-1}
+      RAG_SANDBOX_CONTAINER_PIDS_LIMIT: ${RAG_SANDBOX_CONTAINER_PIDS_LIMIT:-256}
+      RAG_SANDBOX_CONTAINER_HOME_BYTES: ${RAG_SANDBOX_CONTAINER_HOME_BYTES:-268435456}
+      RAG_SANDBOX_CONTAINER_TMP_BYTES: ${RAG_SANDBOX_CONTAINER_TMP_BYTES:-268435456}
+      RAG_SANDBOX_CONTAINER_MAX_CONTAINERS: ${RAG_SANDBOX_CONTAINER_MAX_CONTAINERS:-32}
+      RAG_SANDBOX_CONTAINER_MAX_EXECS: ${RAG_SANDBOX_CONTAINER_MAX_EXECS:-8}
+      RAG_SANDBOX_CONTAINER_MAX_LIFETIME_SECONDS: ${RAG_SANDBOX_CONTAINER_MAX_LIFETIME_SECONDS:-7200}
+      RAG_SANDBOX_CONTAINER_UID: ${RAG_SANDBOX_CONTAINER_UID:-1000}
+      RAG_SANDBOX_CONTAINER_GID: ${RAG_SANDBOX_CONTAINER_GID:-1000}
+      NO_PROXY: localhost,127.0.0.1
+      no_proxy: localhost,127.0.0.1
+    command: uv run --no-sync --no-dev uvicorn rag.sandbox_runner.main:app --host 0.0.0.0 --port 8090 --no-access-log
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8090/healthz || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    depends_on:
+      sandbox-image:
+        condition: service_completed_successfully
+
+  frontend:
+    build:
+      context: .
+      dockerfile: docker/frontend.Dockerfile
+      target: development
+    image: ${COMPOSE_PROJECT_NAME:-rag}-frontend:${RAG_VERSION:-0.8.0.beta4}
+    volumes:
+      - ./frontend/src:/app/src
+      - ./frontend/public:/app/public
+      - ./frontend/index.html:/app/index.html
+      - ./frontend/vite.config.js:/app/vite.config.js
+    ports:
+      - "${RAG_FRONTEND_PORT:-25173}:5173"
+    depends_on:
+      - api
+    networks:
+      - app-network
+    environment:
+      - NODE_ENV=development
+      - RAG_API_PROXY_URL=http://api:5050
+    command: pnpm run server
+    restart: unless-stopped
+
+  # region neo4j
+  graph:
+    image: neo4j:5.26.29
+    ports:
+      - "127.0.0.1:${RAG_NEO4J_HTTP_PORT:-27474}:7474"
+      - "127.0.0.1:${RAG_NEO4J_BOLT_PORT:-27687}:7687"
+    volumes:
+      - type: bind
+        source: ${RAG_STATE_DIR:-./docker/volumes}/neo4j/data
+        target: /data
+      - type: bind
+        source: ${RAG_STATE_DIR:-./docker/volumes}/neo4j/logs
+        target: /logs
+    healthcheck:
+      test: ["CMD-SHELL", "cypher-shell -a bolt://localhost:7687 -u ${RAG_NEO4J_USERNAME:-neo4j} -p ${RAG_NEO4J_PASSWORD:-0123456789} 'RETURN 1;' >/dev/null || exit 1"]
+      interval: 20s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    environment:
+      - NEO4J_AUTH=${RAG_NEO4J_USERNAME:-neo4j}/${RAG_NEO4J_PASSWORD:-0123456789}
+      - NEO4J_server_bolt_listen__address=0.0.0.0:7687
+      - NEO4J_server_http_listen__address=0.0.0.0:7474
+      - ENTITY_EMBEDDING=true
+    networks:
+      - app-network
+    restart: unless-stopped
+  # endregion neo4j
+
+  etcd:
+    image: quay.io/coreos/etcd:v3.5.25
+    logging: *default-logging
+    environment:
+      - ETCD_AUTO_COMPACTION_MODE=revision
+      - ETCD_AUTO_COMPACTION_RETENTION=1000
+      - ETCD_QUOTA_BACKEND_BYTES=4294967296
+      - ETCD_SNAPSHOT_COUNT=50000
+    volumes:
+      - type: bind
+        source: ${RAG_STATE_DIR:-./docker/volumes}/milvus/etcd
+        target: /etcd
+    command: etcd -advertise-client-urls=http://etcd:2379 -listen-client-urls http://0.0.0.0:2379 --data-dir /etcd
+    healthcheck:
+      test: ["CMD", "etcdctl", "endpoint", "health"]
+      interval: 60s
+      timeout: 30s
+      retries: 5
+      start_period: 30s
+    networks:
+      - app-network
+    restart: unless-stopped
+
+  minio:
+    build:
+      context: ./docker/minio
+      dockerfile: Dockerfile
+    image: ${COMPOSE_PROJECT_NAME:-rag}-minio:RELEASE.2024-12-18T13-15-44Z
+    environment:
+      MINIO_ACCESS_KEY: ${RAG_MINIO_ACCESS_KEY:-minioadmin}
+      MINIO_SECRET_KEY: ${RAG_MINIO_SECRET_KEY:-minioadmin}
+    volumes:
+      - type: bind
+        source: ${RAG_STATE_DIR:-./docker/volumes}/milvus/minio
+        target: /data
+      - type: bind
+        source: ${RAG_STATE_DIR:-./docker/volumes}/milvus/minio_config
+        target: /root/.minio
+    command: minio server /data --address 0.0.0.0:9000 --console-address 0.0.0.0:9001
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 60s
+      timeout: 30s
+      retries: 5
+      start_period: 30s
+    ports:
+      - "127.0.0.1:${RAG_MINIO_API_PORT:-29000}:9000"
+      - "127.0.0.1:${RAG_MINIO_CONSOLE_PORT:-29001}:9001"
+    networks:
+      - app-network
+    restart: unless-stopped
+
+  storage-init:
+    build:
+      context: .
+      dockerfile: docker/storage-init.Dockerfile
+    image: ${COMPOSE_PROJECT_NAME:-rag}-storage-init:${RAG_VERSION:-0.8.0.beta4}
+    network_mode: none
+    user: "0:0"
+    volumes:
+      - ${RAG_STATE_DIR:-./docker/volumes}/rag/threads:/app/user-data
+      - ${RAG_STATE_DIR:-./docker/volumes}/rag/skill-sources:/app/skill-sources
+      - ${RAG_STATE_DIR:-./docker/volumes}/rag/skill-projections:/app/skill-projections
+      - ${RAG_STATE_DIR:-./docker/volumes}/milvus/milvus:/var/lib/milvus
+      - ${RAG_STATE_DIR:-./docker/volumes}/milvus/logs:/var/lib/milvus/logs
+    restart: "no"
+
+  milvus:
+    image: milvusdb/milvus:v3.0.2
+    command: ["milvus", "run", "standalone"]
+    # 日志级别由 Milvus 配置拥有，
+    # 这里只对 stdout/stderr 轮转封顶。内存随知识库数据量线性增长，不设 mem_limit：
+    # 硬上界终会被合法增长击穿，击穿模式是 OOM→重启→重加载→再 OOM 的循环。
+    # cpus 上限同时让内置 maxprocs 按 cgroup quota 收敛 GOMAXPROCS。
+    logging: *default-logging
+    cpus: ${RAG_MILVUS_CPUS:-2}
+    security_opt:
+      - seccomp:unconfined
+    environment:
+      MQ_TYPE: woodpecker
+      MINIO_REGION: us-east-1
+      ETCD_ENDPOINTS: etcd:2379
+      MINIO_ADDRESS: minio:9000
+      MINIO_ACCESS_KEY_ID: ${RAG_MINIO_ACCESS_KEY:-minioadmin}
+      MINIO_SECRET_ACCESS_KEY: ${RAG_MINIO_SECRET_KEY:-minioadmin}
+    volumes:
+      - type: bind
+        source: ${RAG_STATE_DIR:-./docker/volumes}/milvus/milvus
+        target: /var/lib/milvus
+      - type: bind
+        source: ${RAG_STATE_DIR:-./docker/volumes}/milvus/logs
+        target: /var/lib/milvus/logs
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9091/healthz"]
+      interval: 60s
+      start_period: 120s
+      timeout: 30s
+      retries: 5
+    ports:
+      - "127.0.0.1:${RAG_MILVUS_PORT:-29530}:19530"
+      - "127.0.0.1:${RAG_MILVUS_HEALTH_PORT:-29091}:9091"
+    depends_on:
+      storage-init:
+        condition: service_completed_successfully
+      etcd:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    networks:
+      - app-network
+    restart: unless-stopped
+
+  postgres:
+    image: postgres:16
+    command: ["postgres", "-c", "max_connections=${RAG_POSTGRES_MAX_CONNECTIONS:-600}"]
+    ports:
+      - "127.0.0.1:${RAG_POSTGRES_PORT:-25432}:5432"
+    environment:
+      - POSTGRES_USER=${RAG_POSTGRES_USER:-postgres}
+      - POSTGRES_PASSWORD=${RAG_POSTGRES_PASSWORD:-postgres}
+      - POSTGRES_DB=${RAG_POSTGRES_DB:-rag}
+      - TZ=${TZ:-Asia/Shanghai}
+    volumes:
+      - type: bind
+        source: ${RAG_STATE_DIR:-./docker/volumes}/postgresql
+        target: /var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${RAG_POSTGRES_USER:-postgres} -d ${RAG_POSTGRES_DB:-rag} || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+    networks:
+      - app-network
+    restart: unless-stopped
+
+  redis:
+    image: redis:7.4.10-alpine
+    ports:
+      - "127.0.0.1:${RAG_REDIS_PORT:-26379}:6379"
+    command: redis-server --appendonly yes
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    volumes:
+      - type: bind
+        source: ${RAG_STATE_DIR:-./docker/volumes}/redis
+        target: /data
+    networks:
+      - app-network
+    restart: unless-stopped
+
+  # lastest version: wget https://gcore.jsdelivr.net/gh/opendatalab/MinerU@master/docker/compose.yaml
+  mineru-api:
+    build:
+      context: .
+      dockerfile: docker/mineru.Dockerfile
+    image: ${COMPOSE_PROJECT_NAME:-rag}-mineru:latest
+    profiles:
+      - all
+    env_file:
+      - ${RAG_ENV_FILE:-.env}
+    ports:
+      - "127.0.0.1:${RAG_MINERU_PORT:-30001}:30001"
+    environment:
+      MINERU_MODEL_SOURCE: local
+      VLLM_USE_V1: "1"
+    entrypoint: mineru-api
+    command:
+      --host 0.0.0.0
+      --port 30001
+      # --allow-public-http-client  # Disabled by default; when binding to 0.0.0.0 or ::, this re-enables *-http-client backends and server_url. Enable only if you accept the SSRF risk.
+      # parameters for vllm-engine
+      # --gpu-memory-utilization 0.5  # If encountering VRAM shortage, reduce the KV cache size by this parameter; if VRAM issues persist, try lowering it further to `0.4` or below.
+    ulimits:
+      memlock: -1
+      stack: 67108864
+    ipc: host
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:30001/health || exit 1"]
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["0"]  # Modify for multiple GPUs: ["0", "1"]
+              capabilities: [gpu]
+    networks:
+      - app-network
+    restart: unless-stopped
+
+  paddlex:
+    build:
+      context: .
+      dockerfile: docker/paddlex.Dockerfile
+    image: ${COMPOSE_PROJECT_NAME:-rag}-paddlex:latest
+    profiles:
+      - all
+    volumes:
+      - type: bind
+        source: ${RAG_STATE_DIR:-./docker/volumes}/paddlex
+        target: /paddlex
+    ports:
+      - "127.0.0.1:${RAG_PADDLEX_PORT:-8080}:8080"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8080/health || exit 1"]
+      interval: 20s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ['0']
+              capabilities: [gpu]
+    networks:
+      - app-network
+    restart: unless-stopped
+
+networks:
+  app-network:
+    driver: bridge

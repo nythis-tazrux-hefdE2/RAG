@@ -1,0 +1,5 @@
+include LICENSE
+recursive-include rag/modules/system/static *.txt *.yaml
+recursive-include rag/modules/extensions/skills *.md
+graft rag/modules/extensions/skills/builtin
+global-exclude *.py[cod]
